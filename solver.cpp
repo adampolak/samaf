@@ -29,10 +29,6 @@ const uint64_t RANDOM_SEED = 42ULL;
 const double TEMP_START = 0.60;
 const double TEMP_END = 0.012;
 const double PENALTY_WEIGHT = 8.0;
-const double SEED_TIME_FRAC = 0.25;
-const double SEED_TIME_CAP = 4.0;
-const double POLISH_TIME_FRAC = 0.20;
-const double POLISH_TIME_CAP = 15.0;
 const double DIAG_INTERVAL = 10.0;
 const int MOVE_TOGGLE = 18;
 const int MOVE_REMOVE = 50;
@@ -42,13 +38,10 @@ const int MOVE_SWAP = 30;
 const double MOVE_SWAP_COLD_FACTOR = 2.0;
 const int MOVE_SIBLING_SWAP = 5;
 const int MOVE_LEVEL_SWAP = 5;
-const int SWAP_TREES = 1;
-const int REDUCE_CHAIN = 1;
-const int REDUCE_THREE_TWO = 1;
 const int CLUSTER_MIN_N = 50;
 const int CLUSTER_MIN_SIDE = 10;
 const double CLUSTER_MIN_FRAC = 0.01;
-const int CLUSTER_MAX_DEPTH = 5;
+const int CLUSTER_MAX_DEPTH = 5;  // for time limit below 180s max depth 2 may be better
 const int CLUSTER_MAX_BLOCKS = 256;
 const double CLUSTER_GLOBAL_MERGE_CAP = 1.0;
 const int EARLY_SPLIT_THRESHOLD = 500;
@@ -161,32 +154,6 @@ struct Interner {
         if (id <= n) return to_string(id);
         auto [a, b] = child[id];
         return "(" + to_newick(a) + "," + to_newick(b) + ")";
-    }
-};
-
-struct Fenwick {
-    int n = 0;
-    vector<int> bit;
-
-    explicit Fenwick(int size = 0) { reset(size); }
-
-    void reset(int size) {
-        n = size;
-        bit.assign(n + 1, 0);
-    }
-
-    void add(int idx, int delta) {
-        for (; idx <= n; idx += idx & -idx) bit[idx] += delta;
-    }
-
-    int sum_prefix(int idx) const {
-        int res = 0;
-        for (; idx > 0; idx -= idx & -idx) res += bit[idx];
-        return res;
-    }
-
-    int sum_range(int l, int r) const {
-        return l <= r ? sum_prefix(r) - sum_prefix(l - 1) : 0;
     }
 };
 
@@ -873,17 +840,15 @@ struct ReductionPreprocessor {
         return false;
     }
 
-    bool try_reduce_at(int x, bool use_chain, bool use_three_two) {
+    bool try_reduce_at(int x) {
         if (!active_taxon[x]) return false;
         if (reduce_common_cherry(x)) return true;
-        if (use_chain && reduce_common_chain(x)) return true;
-        if (use_three_two && reduce_three_two(x)) return true;
+        if (reduce_common_chain(x)) return true;
+        if (reduce_three_two(x)) return true;
         return false;
     }
 
-    bool run(vector<string>& newicks, int& n, bool use_chain, bool use_three_two,
-             ReductionExpansion& expansion) {
-        if (newicks.size() != 2 || n <= 0) return false;
+    bool run(vector<string>& newicks, int& n, ReductionExpansion& expansion) {
         original_n = n;
         trees[0] = MTree::parse_newick(newicks[0], original_n);
         trees[1] = MTree::parse_newick(newicks[1], original_n);
@@ -901,12 +866,12 @@ struct ReductionPreprocessor {
                 int x = queue.front();
                 queue.pop_front();
                 in_queue[x] = 0;
-                try_reduce_at(x, use_chain, use_three_two);
+                try_reduce_at(x);
             }
 
             bool missed = false;
             for (int x = 1; x <= original_n; ++x) {
-                if (active_taxon[x] && try_reduce_at(x, use_chain, use_three_two)) {
+                if (active_taxon[x] && try_reduce_at(x)) {
                     missed = true;
                     break;
                 }
@@ -961,11 +926,6 @@ struct ReductionPreprocessor {
     }
 };
 
-struct Candidate {
-    int node = -1;
-    int size = 0;
-};
-
 struct GreedyMergeSolver {
     int n = 0;
     Tree trees[2];
@@ -1002,125 +962,6 @@ struct GreedyMergeSolver {
             }
         }
         return out;
-    }
-
-    vector<Candidate> build_candidates(int base_idx) {
-        int other_idx = 1 - base_idx;
-        const Tree& base = trees[base_idx];
-        const Tree& other = trees[other_idx];
-        vector<Candidate> candidates;
-        vector<vector<int>> tmp(base.nodes.size());
-
-        for (int v = 0; v < int(base.nodes.size()) && !timer.expired(); ++v) {
-            if (base.is_leaf(v)) {
-                tmp[v].push_back(base.nodes[v].label);
-                continue;
-            }
-
-            int l = base.nodes[v].left, r = base.nodes[v].right;
-            vector<int> merged;
-            merged.reserve(tmp[l].size() + tmp[r].size());
-            size_t i = 0, j = 0;
-            while (i < tmp[l].size() || j < tmp[r].size()) {
-                if (j == tmp[r].size() ||
-                    (i < tmp[l].size() && other.tin[other.leaf_node[tmp[l][i]]] <
-                                             other.tin[other.leaf_node[tmp[r][j]]])) {
-                    merged.push_back(tmp[l][i++]);
-                } else {
-                    merged.push_back(tmp[r][j++]);
-                }
-            }
-            tmp[v].swap(merged);
-            vector<int>().swap(tmp[l]);
-            vector<int>().swap(tmp[r]);
-
-            if (base.leaf_count[v] >= 2) {
-                int other_id = other.analyze_sorted_labels(tmp[v], interner, false).id;
-                if (other_id == base.subtree_id[v]) candidates.push_back({v, base.leaf_count[v]});
-            }
-        }
-
-        sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
-            if (a.size != b.size) return a.size > b.size;
-            return a.node < b.node;
-        });
-        return candidates;
-    }
-
-    static bool can_use_edges(const vector<int>& edges, const vector<int>& used) {
-        for (int e : edges) {
-            if (used[e]) return false;
-        }
-        return true;
-    }
-
-    vector<Component> greedy_forest(int base_idx) {
-        vector<Candidate> candidates = build_candidates(base_idx);
-        vector<Component> comps;
-        vector<int> edge_used[2] = {
-            vector<int>(trees[0].nodes.size(), 0),
-            vector<int>(trees[1].nodes.size(), 0)
-        };
-        Fenwick assigned(trees[base_idx].n);
-        vector<char> assigned_leaf(n + 1, 0);
-
-        for (const Candidate& cand : candidates) {
-            if (timer.expired()) break;
-            const Tree& base = trees[base_idx];
-            if (assigned.sum_range(base.leaf_l[cand.node], base.leaf_r[cand.node]) != 0) continue;
-
-            vector<int> labels = base.collect_leaves(cand.node);
-            vector<int> tin_labels[2] = {
-                trees[0].labels_by_tin(labels),
-                trees[1].labels_by_tin(labels)
-            };
-            Tree::Analysis a0 = trees[0].analyze_sorted_labels(tin_labels[0], interner, true);
-            Tree::Analysis a1 = trees[1].analyze_sorted_labels(tin_labels[1], interner, true);
-            if (a0.id != a1.id) continue;
-            if (!can_use_edges(a0.edges, edge_used[0]) || !can_use_edges(a1.edges, edge_used[1])) continue;
-
-            Component comp;
-            comp.labels = move(labels);
-            comp.tin_labels[0] = move(tin_labels[0]);
-            comp.tin_labels[1] = move(tin_labels[1]);
-            comp.edges[0] = move(a0.edges);
-            comp.edges[1] = move(a1.edges);
-            comp.id = a0.id;
-            comps.push_back(move(comp));
-
-            for (int label : comps.back().labels) {
-                assigned_leaf[label] = 1;
-                assigned.add(trees[base_idx].leaf_rank[label], 1);
-            }
-            for (int ti = 0; ti < 2; ++ti) {
-                for (int e : comps.back().edges[ti]) edge_used[ti][e] = 1;
-            }
-        }
-
-        for (int label = 1; label <= n; ++label) {
-            if (assigned_leaf[label]) continue;
-            Component comp;
-            comp.labels = {label};
-            comp.tin_labels[0] = {label};
-            comp.tin_labels[1] = {label};
-            comp.id = label;
-            comps.push_back(move(comp));
-        }
-        return comps;
-    }
-
-    vector<Component> singleton_forest() const {
-        vector<Component> comps;
-        comps.reserve(n);
-        for (int label = 1; label <= n; ++label) {
-            Component comp;
-            comp.labels = {label};
-            comp.tin_labels[0] = {label};
-            comp.tin_labels[1] = {label};
-            comp.id = label;
-            comps.push_back(move(comp));
-        }
-        return comps;
     }
 
     struct Forest {
@@ -1369,39 +1210,6 @@ struct GreedyMergeSolver {
         });
         return out;
     }
-
-    vector<Component> solve() {
-        vector<Component> best;
-        for (int base = 0; base < 2 && !timer.expired(); ++base) {
-            VERBOSE_CERR << "# building greedy forest from tree " << (base + 1) << "\n";
-            vector<Component> initial = greedy_forest(base);
-            Forest f = make_forest(move(initial));
-            VERBOSE_CERR << "# initial components " << f.active_count << "\n";
-            improve(f);
-            vector<Component> current = active_components(f);
-            VERBOSE_CERR << "# final components from tree " << (base + 1) << ": " << current.size() << "\n";
-            if (best.empty() || current.size() < best.size()) best = move(current);
-        }
-
-        if (!timer.expired() && (n <= 5000 || timer.limit_seconds >= 10.0)) {
-            VERBOSE_CERR << "# building singleton-start forest\n";
-            Forest f = make_forest(singleton_forest());
-            improve(f);
-            vector<Component> current = active_components(f);
-            VERBOSE_CERR << "# final components from singleton start: " << current.size() << "\n";
-            if (best.empty() || current.size() < best.size()) best = move(current);
-        }
-
-        if (best.empty()) {
-            for (int label = 1; label <= n; ++label) {
-                Component c;
-                c.labels = {label};
-                c.id = label;
-                best.push_back(move(c));
-            }
-        }
-        return best;
-    }
 };
 
 static double read_time_limit(int argc, char** argv) {
@@ -1497,105 +1305,99 @@ struct AnnealSolver {
         nonroot_edges.clear();
         interner.reset(n);
 
-        if (newicks.size() == 2) {
-            bool do_swap = SWAP_TREES != 0;
-            if (do_swap) swap(newicks[0], newicks[1]);
-            int reduction_before_n = n;
-            size_t reduction_before_chars = 0;
-            for (const string& s : newicks) reduction_before_chars += s.size();
-            auto reduction_start = chrono::steady_clock::now();
-            bool reduction_changed = false;
-            ReductionPreprocessor pre;
-            reduction_changed = pre.run(newicks, n, REDUCE_CHAIN, REDUCE_THREE_TWO, reductions);
-            double reduction_seconds = chrono::duration<double>(
-                chrono::steady_clock::now() - reduction_start).count();
-            size_t reduction_after_chars = 0;
-            for (const string& s : newicks) reduction_after_chars += s.size();
-            VERBOSE_CERR << "# reductions timing solver_id " << reinterpret_cast<uintptr_t>(this)
-                 << " changed " << (reduction_changed ? 1 : 0)
-                 << " time_sec " << reduction_seconds
-                 << " leaves_before " << reduction_before_n
-                 << " leaves_after " << n
-                 << " nodes_before " << max(0, 2 * reduction_before_n - 1)
-                 << " nodes_after " << max(0, 2 * n - 1)
-                 << " newick_chars_before " << reduction_before_chars
-                 << " newick_chars_after " << reduction_after_chars
-                 << " chain " << REDUCE_CHAIN
-                 << " three_two " << REDUCE_THREE_TWO << "\n";
-            trees[0] = Tree::parse_newick(newicks[0], n);
-            trees[1] = Tree::parse_newick(newicks[1], n);
-            interner.reset(n);
-            trees[0].preprocess(interner);
-            trees[1].preprocess(interner);
-            for (int v = 0; v < int(trees[0].nodes.size()); ++v) {
-                if (v == trees[0].root) continue;
-                nonroot_edges.push_back(v);
-            }
+        int reduction_before_n = n;
+        size_t reduction_before_chars = 0;
+        for (const string& s : newicks) reduction_before_chars += s.size();
+        auto reduction_start = chrono::steady_clock::now();
+        bool reduction_changed = false;
+        ReductionPreprocessor pre;
+        reduction_changed = pre.run(newicks, n, reductions);
+        double reduction_seconds = chrono::duration<double>(
+            chrono::steady_clock::now() - reduction_start).count();
+        size_t reduction_after_chars = 0;
+        for (const string& s : newicks) reduction_after_chars += s.size();
+        VERBOSE_CERR << "# reductions timing solver_id " << reinterpret_cast<uintptr_t>(this)
+             << " changed " << (reduction_changed ? 1 : 0)
+             << " time_sec " << reduction_seconds
+             << " leaves_before " << reduction_before_n
+             << " leaves_after " << n
+             << " nodes_before " << max(0, 2 * reduction_before_n - 1)
+             << " nodes_after " << max(0, 2 * n - 1)
+             << " newick_chars_before " << reduction_before_chars
+             << " newick_chars_after " << reduction_after_chars << "\n";
+        trees[0] = Tree::parse_newick(newicks[0], n);
+        trees[1] = Tree::parse_newick(newicks[1], n);
+        interner.reset(n);
+        trees[0].preprocess(interner);
+        trees[1].preprocess(interner);
+        for (int v = 0; v < int(trees[0].nodes.size()); ++v) {
+            if (v == trees[0].root) continue;
+            nonroot_edges.push_back(v);
+        }
 
-            int num_t0 = int(trees[0].nodes.size());
-            t1_min_rank_vec.assign(num_t0, n + 1);
-            t1_max_rank_vec.assign(num_t0, -1);
-            {
-                vector<int> po(num_t0);
-                iota(po.begin(), po.end(), 0);
-                sort(po.begin(), po.end(), [&](int a, int b) {
-                    return trees[0].tout[a] < trees[0].tout[b];
-                });
-                for (int v : po) {
-                    if (trees[0].is_leaf(v)) {
-                        int r = trees[1].leaf_rank[trees[0].nodes[v].label];
-                        t1_min_rank_vec[v] = r;
-                        t1_max_rank_vec[v] = r;
-                    } else {
-                        int l = trees[0].nodes[v].left;
-                        int r = trees[0].nodes[v].right;
-                        t1_min_rank_vec[v] = min(t1_min_rank_vec[l], t1_min_rank_vec[r]);
-                        t1_max_rank_vec[v] = max(t1_max_rank_vec[l], t1_max_rank_vec[r]);
-                    }
+        int num_t0 = int(trees[0].nodes.size());
+        t1_min_rank_vec.assign(num_t0, n + 1);
+        t1_max_rank_vec.assign(num_t0, -1);
+        {
+            vector<int> po(num_t0);
+            iota(po.begin(), po.end(), 0);
+            sort(po.begin(), po.end(), [&](int a, int b) {
+                return trees[0].tout[a] < trees[0].tout[b];
+            });
+            for (int v : po) {
+                if (trees[0].is_leaf(v)) {
+                    int r = trees[1].leaf_rank[trees[0].nodes[v].label];
+                    t1_min_rank_vec[v] = r;
+                    t1_max_rank_vec[v] = r;
+                } else {
+                    int l = trees[0].nodes[v].left;
+                    int r = trees[0].nodes[v].right;
+                    t1_min_rank_vec[v] = min(t1_min_rank_vec[l], t1_min_rank_vec[r]);
+                    t1_max_rank_vec[v] = max(t1_max_rank_vec[l], t1_max_rank_vec[r]);
                 }
             }
+        }
 
-            t1_sorted_edges = nonroot_edges;
-            sort(t1_sorted_edges.begin(), t1_sorted_edges.end(), [&](int a, int b) {
-                return t1_min_rank_vec[a] < t1_min_rank_vec[b];
+        t1_sorted_edges = nonroot_edges;
+        sort(t1_sorted_edges.begin(), t1_sorted_edges.end(), [&](int a, int b) {
+            return t1_min_rank_vec[a] < t1_min_rank_vec[b];
+        });
+        t1_edge_pos.assign(num_t0, -1);
+        for (int i = 0; i < int(t1_sorted_edges.size()); ++i) {
+            t1_edge_pos[t1_sorted_edges[i]] = i;
+        }
+
+        pair_window = max(10, int(sqrt(double(nonroot_edges.size()))));
+
+        t0_min_rank_vec.assign(num_t0, n + 1);
+        t0_max_rank_vec.assign(num_t0, -1);
+        {
+            vector<int> po(num_t0);
+            iota(po.begin(), po.end(), 0);
+            sort(po.begin(), po.end(), [&](int a, int b) {
+                return trees[0].tout[a] < trees[0].tout[b];
             });
-            t1_edge_pos.assign(num_t0, -1);
-            for (int i = 0; i < int(t1_sorted_edges.size()); ++i) {
-                t1_edge_pos[t1_sorted_edges[i]] = i;
-            }
-
-            pair_window = max(10, int(sqrt(double(nonroot_edges.size()))));
-
-            t0_min_rank_vec.assign(num_t0, n + 1);
-            t0_max_rank_vec.assign(num_t0, -1);
-            {
-                vector<int> po(num_t0);
-                iota(po.begin(), po.end(), 0);
-                sort(po.begin(), po.end(), [&](int a, int b) {
-                    return trees[0].tout[a] < trees[0].tout[b];
-                });
-                for (int v : po) {
-                    if (trees[0].is_leaf(v)) {
-                        int r = trees[0].leaf_rank[trees[0].nodes[v].label];
-                        t0_min_rank_vec[v] = r;
-                        t0_max_rank_vec[v] = r;
-                    } else {
-                        int l = trees[0].nodes[v].left;
-                        int r = trees[0].nodes[v].right;
-                        t0_min_rank_vec[v] = min(t0_min_rank_vec[l], t0_min_rank_vec[r]);
-                        t0_max_rank_vec[v] = max(t0_max_rank_vec[l], t0_max_rank_vec[r]);
-                    }
+            for (int v : po) {
+                if (trees[0].is_leaf(v)) {
+                    int r = trees[0].leaf_rank[trees[0].nodes[v].label];
+                    t0_min_rank_vec[v] = r;
+                    t0_max_rank_vec[v] = r;
+                } else {
+                    int l = trees[0].nodes[v].left;
+                    int r = trees[0].nodes[v].right;
+                    t0_min_rank_vec[v] = min(t0_min_rank_vec[l], t0_min_rank_vec[r]);
+                    t0_max_rank_vec[v] = max(t0_max_rank_vec[l], t0_max_rank_vec[r]);
                 }
             }
+        }
 
-            t0_sorted_edges = nonroot_edges;
-            sort(t0_sorted_edges.begin(), t0_sorted_edges.end(), [&](int a, int b) {
-                return t0_min_rank_vec[a] < t0_min_rank_vec[b];
-            });
-            t0_edge_pos.assign(num_t0, -1);
-            for (int i = 0; i < int(t0_sorted_edges.size()); ++i) {
-                t0_edge_pos[t0_sorted_edges[i]] = i;
-            }
+        t0_sorted_edges = nonroot_edges;
+        sort(t0_sorted_edges.begin(), t0_sorted_edges.end(), [&](int a, int b) {
+            return t0_min_rank_vec[a] < t0_min_rank_vec[b];
+        });
+        t0_edge_pos.assign(num_t0, -1);
+        for (int i = 0; i < int(t0_sorted_edges.size()); ++i) {
+            t0_edge_pos[t0_sorted_edges[i]] = i;
         }
     }
 
@@ -1606,60 +1408,6 @@ struct AnnealSolver {
             if (v != trees[0].root) cut[v] = 1;
         }
         return cut;
-    }
-
-    void collect_descendants(int node, vector<int>& out) const {
-        vector<int> st = {node};
-        while (!st.empty()) {
-            int v = st.back();
-            st.pop_back();
-            out.push_back(v);
-            if (!trees[0].is_leaf(v)) {
-                st.push_back(trees[0].nodes[v].left);
-                st.push_back(trees[0].nodes[v].right);
-            }
-        }
-    }
-
-    vector<Candidate> build_common_clade_candidates() {
-        const Tree& base = trees[0];
-        const Tree& other = trees[1];
-        vector<Candidate> candidates;
-        vector<vector<int>> tmp(base.nodes.size());
-
-        for (int v = 0; v < int(base.nodes.size()) && !timer.expired(); ++v) {
-            if (base.is_leaf(v)) {
-                tmp[v].push_back(base.nodes[v].label);
-                continue;
-            }
-            int l = base.nodes[v].left, r = base.nodes[v].right;
-            vector<int> merged;
-            merged.reserve(tmp[l].size() + tmp[r].size());
-            size_t i = 0, j = 0;
-            while (i < tmp[l].size() || j < tmp[r].size()) {
-                if (j == tmp[r].size() ||
-                    (i < tmp[l].size() && other.tin[other.leaf_node[tmp[l][i]]] <
-                                             other.tin[other.leaf_node[tmp[r][j]]])) {
-                    merged.push_back(tmp[l][i++]);
-                } else {
-                    merged.push_back(tmp[r][j++]);
-                }
-            }
-            tmp[v].swap(merged);
-            vector<int>().swap(tmp[l]);
-            vector<int>().swap(tmp[r]);
-
-            if (base.leaf_count[v] >= 2) {
-                int other_id = other.analyze_sorted_labels(tmp[v], interner, false).id;
-                if (other_id == base.subtree_id[v]) candidates.push_back({v, base.leaf_count[v]});
-            }
-        }
-
-        sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
-            if (a.size != b.size) return a.size > b.size;
-            return a.node < b.node;
-        });
-        return candidates;
     }
 
     struct ClusterSplit {
@@ -1681,7 +1429,7 @@ struct AnnealSolver {
 
     ClusterSplit find_cluster_split() const {
         ClusterSplit split;
-        if (newicks.size() != 2 || n < CLUSTER_MIN_N) return split;
+        if (n < CLUSTER_MIN_N) return split;
 
         int min_side = max(CLUSTER_MIN_SIDE,
                            int(ceil(CLUSTER_MIN_FRAC * double(n))));
@@ -1749,7 +1497,7 @@ struct AnnealSolver {
 
     MultiClusterSplit find_multi_cluster_split(int max_cuts) const {
         MultiClusterSplit split;
-        if (newicks.size() != 2 || n < CLUSTER_MIN_N || max_cuts <= 0) return split;
+        if (n < CLUSTER_MIN_N || max_cuts <= 0) return split;
 
         int min_side = max(CLUSTER_MIN_SIDE,
                            int(ceil(CLUSTER_MIN_FRAC * double(n))));
@@ -1864,96 +1612,12 @@ struct AnnealSolver {
         return split;
     }
 
-    vector<unsigned char> initial_cuts() {
-        vector<unsigned char> cut = singleton_cuts();
-        vector<unsigned char> merge_seed = seed_from_merge_solver();
-        AnnealEval merge_eval = evaluate(merge_seed, false);
-        if (merge_eval.feasible && merge_eval.components < n) cut = merge_seed;
-
-        vector<unsigned char> common_cut = singleton_cuts();
-        vector<Candidate> candidates = build_common_clade_candidates();
-        vector<int> edge_used_t2(trees[1].nodes.size(), 0);
-        Fenwick assigned(n);
-
-        for (const Candidate& cand : candidates) {
-            if (timer.expired()) break;
-            const Tree& t0 = trees[0];
-            if (assigned.sum_range(t0.leaf_l[cand.node], t0.leaf_r[cand.node]) != 0) continue;
-
-            vector<int> labels = t0.collect_leaves(cand.node);
-            vector<int> tin1 = trees[1].labels_by_tin(labels);
-            Tree::Analysis a1 = trees[1].analyze_sorted_labels(tin1, interner, true);
-            bool ok = true;
-            for (int e : a1.edges) {
-                if (edge_used_t2[e]) {
-                    ok = false;
-                    break;
-                }
-            }
-            if (!ok) continue;
-
-            if (cand.node != trees[0].root) common_cut[cand.node] = 1;
-            vector<int> desc;
-            collect_descendants(cand.node, desc);
-            for (int v : desc) {
-                if (v != cand.node) common_cut[v] = 0;
-            }
-            for (int label : labels) assigned.add(trees[0].leaf_rank[label], 1);
-            for (int e : a1.edges) edge_used_t2[e] = 1;
-        }
-
-        AnnealEval common_eval = evaluate(common_cut, false);
-        AnnealEval cur_eval = evaluate(cut, false);
-        if (common_eval.feasible && common_eval.components < cur_eval.components) cut = common_cut;
-
-        AnnealEval ev = evaluate(cut, false);
-        if (!ev.feasible) {
-            return singleton_cuts();
-        }
-        return cut;
-    }
-
     void perturb_cut(vector<unsigned char>& cut, int flip_count) {
         if (nonroot_edges.empty()) return;
         for (int i = 0; i < flip_count; ++i) {
             int e = nonroot_edges[rnd_int(nonroot_edges.size())];
             cut[e] ^= 1;
         }
-    }
-
-    vector<unsigned char> cuts_from_components(const vector<Component>& comps) {
-        vector<unsigned char> used(trees[0].nodes.size(), 0);
-        for (const Component& c : comps) {
-            vector<int> tin0 = trees[0].labels_by_tin(c.labels);
-            Tree::Analysis a0 = trees[0].analyze_sorted_labels(tin0, interner, true);
-            for (int e : a0.edges) used[e] = 1;
-        }
-
-        vector<unsigned char> cut(trees[0].nodes.size(), 0);
-        for (int v : nonroot_edges) {
-            if (!used[v]) cut[v] = 1;
-        }
-        return cut;
-    }
-
-    vector<unsigned char> seed_from_merge_solver() {
-        if (timer.expired()) return singleton_cuts();
-        double seed_limit = min(SEED_TIME_CAP, max(0.05, timer.limit_seconds * SEED_TIME_FRAC));
-        Timer seed_timer(seed_limit);
-        GreedyMergeSolver helper(seed_timer);
-        helper.n = n;
-        helper.trees[0] = trees[0];
-        helper.trees[1] = trees[1];
-        helper.interner = interner;
-        vector<Component> comps = helper.solve();
-        vector<unsigned char> cut = cuts_from_components(comps);
-        AnnealEval ev = evaluate(cut, false);
-        if (!ev.feasible) {
-            VERBOSE_CERR << "# merge seed was not feasible after cut encoding; using singleton seed\n";
-            return singleton_cuts();
-        }
-        VERBOSE_CERR << "# merge seed components " << ev.components << " seed_time_limit " << seed_limit << "\n";
-        return cut;
     }
 
     AnnealEval evaluate(const vector<unsigned char>& cut, bool keep_components) {
@@ -2592,71 +2256,6 @@ struct AnnealSolver {
         }
     }
 
-    // Post-greedy swap refinement: try sibling/ancestor/descendant swaps, accept strict
-    // improvements only. Followed by another removal-greedy pass to exploit new state.
-    // Only runs if time remains after greedy convergence (harmless for large n).
-    void swap_greedy_finish(vector<unsigned char>& cut, AnnealEval& cur,
-                            vector<unsigned char>& best_cut, AnnealEval& best,
-                            double stop_time) {
-        auto stopped = [&]() {
-            return timer.expired() || (stop_time >= 0.0 && timer.elapsed() >= stop_time);
-        };
-        auto try_swap = [&](int remove_e, int add_e) -> bool {
-            cut[remove_e] = 0; cut[add_e] = 1;
-            AnnealEval nx = evaluate(cut, false);
-            if (nx.feasible && nx.components < cur.components) {
-                cur = nx;
-                if (cur.components < best.components) { best = cur; best_cut = cut; }
-                return true;
-            }
-            cut[remove_e] = 1; cut[add_e] = 0;
-            return false;
-        };
-        bool outer_changed = true;
-        while (outer_changed && !stopped()) {
-            outer_changed = false;
-            vector<int> order = nonroot_edges;
-            for (int i = int(order.size()) - 1; i > 0; --i) swap(order[i], order[rnd_int(i + 1)]);
-            for (int e : order) {
-                if (!cut[e] || stopped()) continue;
-                bool found = false;
-                int p  = trees[0].nodes[e].parent;
-                // Sibling swap (1 hop horizontal)
-                if (!found && p >= 0 && p != trees[0].root) {
-                    int sib = (trees[0].nodes[p].left == e) ? trees[0].nodes[p].right : trees[0].nodes[p].left;
-                    if (sib >= 0 && sib != e && !cut[sib])
-                        found = try_swap(e, sib);
-                }
-                // Ancestor swap (1 level up)
-                if (!found && p >= 0 && p != trees[0].root && !cut[p])
-                    found = try_swap(e, p);
-                // Grandparent swap (2 levels up)
-                if (!found && p >= 0 && p != trees[0].root) {
-                    int gp = trees[0].nodes[p].parent;
-                    if (gp >= 0 && gp != trees[0].root && !cut[gp])
-                        found = try_swap(e, gp);
-                }
-                // Descendant swaps (1 level down)
-                for (int child : {trees[0].nodes[e].left, trees[0].nodes[e].right}) {
-                    if (found || child < 0 || cut[child] || stopped()) continue;
-                    found = try_swap(e, child);
-                }
-                // Grandchild swaps (2 levels down)
-                for (int child : {trees[0].nodes[e].left, trees[0].nodes[e].right}) {
-                    if (found || child < 0 || cut[child] || stopped()) continue;
-                    for (int gc : {trees[0].nodes[child].left, trees[0].nodes[child].right}) {
-                        if (found || gc < 0 || cut[gc]) continue;
-                        found = try_swap(e, gc);
-                    }
-                }
-                if (found) outer_changed = true;
-            }
-            // If any swap improved, re-run removal greedy to exploit new state
-            if (outer_changed && !stopped()) {
-                greedy_finish_exact(cut, cur, best_cut, best, stop_time);
-            }
-        }
-    }
 
     struct SearchState {
         vector<unsigned char> cut;
@@ -2684,7 +2283,6 @@ struct AnnealSolver {
         double stop_time)
     {
         SearchState st;
-        if (newicks.size() != 2) return st;
 
         st.cut = initial_cut;
         st.cur = evaluate(st.cut, false);
@@ -2756,12 +2354,8 @@ struct AnnealSolver {
     SearchState start_search() {
         SearchState st;
 
-        st.cut = initial_cuts();
+        st.cut = singleton_cuts();
         st.cur = evaluate(st.cut, false);
-        if (!st.cur.feasible) {
-            st.cut = singleton_cuts();
-            st.cur = evaluate(st.cut, false);
-        }
 
         // Pre-SA greedy: polish initial state before SA. n<=1000: exact greedy (tie-aware).
         // n<=2000: fast greedy (approximate but cheaper) for a moderate warm-start.
@@ -2782,8 +2376,7 @@ struct AnnealSolver {
         st.temp = TEMP_START;
         st.anneal_start = timer.elapsed();
         double time_limit = timer.limit_seconds;
-        double polish_budget = min(POLISH_TIME_CAP, max(0.0, time_limit * POLISH_TIME_FRAC));
-        st.anneal_stop_time = max(st.anneal_start, time_limit - polish_budget);
+        st.anneal_stop_time = max(st.anneal_start, time_limit);
         st.anneal_budget = max(0.001, st.anneal_stop_time - st.anneal_start);
         st.last_diag_time = st.anneal_start;
         st.last_improvement_time = st.anneal_start;
@@ -2796,11 +2389,6 @@ struct AnnealSolver {
              << " temp_end " << TEMP_END
              << " penalty " << PENALTY_WEIGHT
              << " diag_interval " << DIAG_INTERVAL
-             << " polish " << POLISH_TIME_FRAC << "/"
-             << POLISH_TIME_CAP
-             << " swap_trees " << SWAP_TREES
-             << " reductions " << REDUCE_CHAIN << "/"
-             << REDUCE_THREE_TWO
              << " moves " << MOVE_TOGGLE << "/"
              << MOVE_REMOVE << "/"
              << MOVE_ADD << "/"
@@ -2829,10 +2417,6 @@ struct AnnealSolver {
             return true;
         }
 
-        // propose() already applied the move to st.cut via set_cut.
-        // Fast evaluate on every step, exact-validate before committing an incumbent.
-        // evaluate_fast uses hashes for shape equality; keeping exact validation on
-        // best updates avoids submitting a hash false-positive solution.
         double old_energy = st.cur.energy;
         AnnealEval new_eval = evaluate_fast(st.cut);
         double delta = new_eval.energy - old_energy;
@@ -2842,14 +2426,10 @@ struct AnnealSolver {
             ++st.accepted;
             st.cur = new_eval;
             if (st.cur.feasible && st.cur.components < st.best.components) {
-                AnnealEval exact_eval = evaluate(st.cut, false);
-                st.cur = exact_eval;
-                if (st.cur.feasible && st.cur.components < st.best.components) {
-                    st.best = st.cur;
-                    st.best_cut = st.cut;
-                    ++st.valid_improvements;
-                    st.last_improvement_time = timer.elapsed();
-                }
+                st.best = st.cur;
+                st.best_cut = st.cut;
+                ++st.valid_improvements;
+                st.last_improvement_time = timer.elapsed();
             }
         } else {
             rollback(st.cut, move);
@@ -2857,163 +2437,6 @@ struct AnnealSolver {
         ++st.iterations;
         emit_progress_diagnostic(st);
         return true;
-    }
-
-    void finish_search(SearchState& st, double stop_time = -1.0) {
-        if (!st.initialized) return;
-        auto stopped = [&]() {
-            return timer.expired() || (stop_time >= 0.0 && timer.elapsed() >= stop_time);
-        };
-        auto time_remaining = [&]() -> double {
-            if (timer.expired()) return 0.0;
-            if (stop_time >= 0.0) return max(0.0, stop_time - timer.elapsed());
-            return max(0.0, timer.limit_seconds - timer.elapsed());
-        };
-
-        if (st.best.feasible && !stopped()) {
-            st.cut = st.best_cut;
-            st.cur = st.best;
-            double rem = time_remaining();
-            double ils_reserve;
-            if (rem >= 4.0) {
-                ils_reserve = min(rem - 2.0, 4.0);  // Large budget: greedy gets min 2.0s.
-            } else if (rem >= 1.5) {
-                ils_reserve = rem - 1.0;  // Smaller budget: greedy gets 1.0s, ILS gets rest.
-            } else {
-                ils_reserve = 0.0;
-            }
-            double greedy_stop = (stop_time < 0.0 ? timer.limit_seconds : stop_time) - ils_reserve;
-            greedy_finish_exact(st.cut, st.cur, st.best_cut, st.best, greedy_stop);
-            // Swap greedy: try sibling/level swaps after removal convergence.
-            // Only runs for small/medium n where greedy finishes with time to spare.
-            if (!stopped() && timer.elapsed() < greedy_stop) {
-                swap_greedy_finish(st.cut, st.cur, st.best_cut, st.best, greedy_stop);
-            }
-        }
-
-        // ILS: use remaining time for iterated local search.
-        long long ils_improvements = 0;
-        int ils_cycles = 0;
-        // ILS baseline: best components from exact evaluate (always initialized if feasible).
-        int ils_true_best_comp = st.best.feasible
-            ? evaluate(st.best_cut, false).components : INT_MAX;
-        vector<unsigned char> ils_true_best_cut = st.best_cut;
-        while (!stopped() && st.best.feasible && time_remaining() >= 1.0 && ils_true_best_comp < INT_MAX) {
-            ++ils_cycles;
-            double cycle_start = timer.elapsed();
-            double rem = time_remaining();
-            // Each cycle uses up to 1/5 of remaining time, capped at 15s, min 0.5s.
-            // Using 1/5 instead of 1/3 allows more cycles and perturbation diversity.
-            double cycle_budget = min(15.0, max(0.5, rem / 5.0));
-
-            // Alternate small and large perturbations.
-            int k_small = max(1, int(sqrt(double(max(1, ils_true_best_comp)) / 10.0)));
-	        int k_large = max(k_small + 1, int(sqrt(double(n))));
-	        int k = (ils_cycles % 2 == 1) ? k_small : k_large;
-            // Perturb from the true best (not fast-best, to avoid drifting).
-            st.cut = ils_true_best_cut;
-            for (int i = 0; i < k; ++i) {
-		        if (nonroot_edges.empty()) break;
-                int cut_e = -1, uncut_e = -1;
-                for (int t = 0; t < 30 && cut_e < 0; ++t) {
-                    int e = nonroot_edges[rnd_int(nonroot_edges.size())];
-                    if (st.cut[e]) cut_e = e;
-                }
-                for (int t = 0; t < 30 && uncut_e < 0; ++t) {
-                    int e = nonroot_edges[rnd_int(nonroot_edges.size())];
-                    if (!st.cut[e]) uncut_e = e;
-                }
-                if (cut_e >= 0 && uncut_e >= 0) { st.cut[cut_e] = 0; st.cut[uncut_e] = 1; }
-                else if (cut_e >= 0) st.cut[cut_e] ^= 1;
-            }
-            // Resync state after perturbation using exact evaluate.
-            st.cur = evaluate(st.cut, false);
-            // Exact greedy polish from perturbed state: safe with tie acceptance.
-            greedy_finish_exact(st.cut, st.cur, ils_true_best_cut, st.best, stop_time);
-            // Check if greedy found improvement (evaluate() is exact, no validation needed).
-            if (st.cur.feasible && st.cur.components < ils_true_best_comp) {
-                ils_true_best_comp = st.cur.components;
-                ils_true_best_cut = st.cut;
-                st.best_cut = st.cut;
-                st.best.components = st.cur.components;
-                st.best.feasible = true;
-                st.best.energy = double(st.cur.components);
-                ++st.valid_improvements;
-                ++ils_improvements;
-            }
-            // Use post-greedy state as reference for the mini-SA acceptance criterion.
-            AnnealEval fast_cycle_best = st.cur;
-            vector<unsigned char> fast_cycle_best_cut = st.cut;
-
-            // Mini-SA: full geometric cooling from temp_start to temp_end over cycle_budget.
-            while (!stopped()) {
-                double in_cycle = timer.elapsed() - cycle_start;
-                if (in_cycle >= cycle_budget) break;
-
-                if ((st.iterations & 31) == 0) {
-                    double frac = min(1.0, in_cycle / cycle_budget);
-                    st.temp = TEMP_START * pow(TEMP_END / TEMP_START, frac);
-                }
-
-                AnnealMove move = propose(st.cut, st.temp);
-                if (move.changes.empty()) { ++st.iterations; continue; }
-
-                double ils_old_e = st.cur.energy;
-                AnnealEval ils_new_eval = evaluate(st.cut, false);
-                double delta = ils_new_eval.energy - ils_old_e;
-                bool take = delta <= 0.0 || rnd01() < exp(-delta / max(1e-9, st.temp));
-                if (take) {
-                    ++st.accepted;
-                    if (delta > 0.0) ++st.accepted_worse;
-                    st.cur = ils_new_eval;
-                    if (st.cur.feasible && st.cur.components < fast_cycle_best.components) {
-                        fast_cycle_best = st.cur;
-                        fast_cycle_best_cut = st.cut;
-                    }
-                } else {
-                    rollback(st.cut, move);
-                }
-                ++st.iterations;
-            }
-
-            // Mini-SA best: evaluate() is exact since SA loop now uses evaluate().
-            if (fast_cycle_best.feasible && fast_cycle_best.components < ils_true_best_comp) {
-                ils_true_best_comp = fast_cycle_best.components;
-                ils_true_best_cut = fast_cycle_best_cut;
-                st.best_cut = fast_cycle_best_cut;
-                st.best.components = fast_cycle_best.components;
-                st.best.feasible = true;
-                st.best.energy = double(fast_cycle_best.components);
-                ++st.valid_improvements;
-                ++ils_improvements;
-            }
-
-            // Exact greedy polish from the cycle's best state.
-            if (st.best.feasible && !stopped()) {
-                st.cut = ils_true_best_cut;
-                st.cur = st.best;
-                greedy_finish_exact(st.cut, st.cur, ils_true_best_cut, st.best, stop_time);
-                if (st.best.components < ils_true_best_comp) {
-                    ils_true_best_comp = st.best.components;
-                    ils_true_best_cut = st.cut;
-                }
-            }
-        }
-        // Ensure final best uses the validated true best.
-        if (ils_true_best_comp < INT_MAX) {
-            st.best_cut = ils_true_best_cut;
-        }
-
-        double total_elapsed = max(1e-9, timer.elapsed());
-        VERBOSE_CERR << "# sa final best " << st.best.components
-             << " leaves " << n
-             << " iterations " << st.iterations
-             << " iter_per_sec " << static_cast<long long>(double(st.iterations) / total_elapsed)
-             << " accepted " << st.accepted
-             << " accepted_worse " << st.accepted_worse
-             << " valid_improvements " << st.valid_improvements
-             << " ils_cycles " << ils_cycles
-             << " ils_improvements " << ils_improvements << "\n";
     }
 
     vector<Component> components_from_search(const SearchState& st) {
@@ -3024,13 +2447,6 @@ struct AnnealSolver {
             return a.labels.front() < b.labels.front();
         });
         return out.comps;
-    }
-
-    vector<Component> solve() {
-        SearchState st = start_search();
-        while (anneal_step(st)) {}
-        finish_search(st);
-        return components_from_search(st);
     }
 
     vector<Component> singleton_solution() const {
@@ -3058,32 +2474,16 @@ struct AnnealSolver {
 
 };
 
-struct RawInput {
-    int n = 0;
-    int trees = 0;
+vector<string> read_raw_input() {
     vector<string> newicks;
-};
-
-static RawInput read_raw_input() {
-    RawInput input;
     string line;
     while (getline(cin, line)) {
         if (line.empty()) continue;
-        if (line[0] == '#') {
-            if (line.rfind("#p ", 0) == 0) {
-                size_t p = line.find(' ', 3);
-                input.trees = stoi(line.substr(3, p - 3));
-                input.n = stoi(line.substr(p + 1));
-            }
-            continue;
-        }
-        input.newicks.push_back(line);
-        if (input.trees > 0 && int(input.newicks.size()) >= input.trees) break;
+        if (line[0] == '#') continue;
+        newicks.push_back(line);
     }
-    if (input.n == 0) input.n = AnnealSolver::infer_leaf_count(input.newicks);
-    if (input.trees == 0) input.trees = int(input.newicks.size());
-    assert(input.trees == 2);
-    return input;
+    assert(newicks.size() == 2);
+    return newicks;
 }
 
 static string relabel_newick(const string& s, const vector<int>& relabel) {
@@ -3302,12 +2702,7 @@ struct ClusterManager {
             }
         }
 
-        double polish_budget = (!has_large_block || has_medium_super_large_block)
-            ? min(POLISH_TIME_CAP, max(0.0, timer.limit_seconds * POLISH_TIME_FRAC))
-            : 0.0;
-        double global_merge_budget = min(CLUSTER_GLOBAL_MERGE_CAP,
-                                         max(0.0, timer.limit_seconds * 0.05));
-        double total_sa_end = timer.limit_seconds - polish_budget - global_merge_budget;
+        double total_sa_end = timer.limit_seconds - CLUSTER_GLOBAL_MERGE_CAP;
         bool has_very_large_block = false;
         bool has_only_small_blocks = true;
         bool has_only_very_small_blocks = true;
@@ -3325,7 +2720,6 @@ struct ClusterManager {
             (has_medium_super_large_block ? 1 : 0) +
             (has_only_small_blocks ? 3 : 0) +
             (has_only_very_small_blocks ? 3 : 0));
-        if (has_medium_super_large_block && polish_budget > 0.0) total_rounds = min(total_rounds, 3);
 
         double sa_start_time = timer.elapsed();
         double per_round = max(0.1, (total_sa_end - sa_start_time) / total_rounds);
@@ -3398,29 +2792,6 @@ struct ClusterManager {
              << " splits " << split_count
              << " rounds " << total_rounds
              << " interleaved_iterations " << total_iterations << "\n";
-
-        vector<Node*> order = leaves;
-        sort(order.begin(), order.end(), [](const Node* a, const Node* b) {
-            int ca = a->state_started ? a->state.best.components : a->solver->n;
-            int cb = b->state_started ? b->state.best.components : b->solver->n;
-            return ca > cb;
-        });
-        double block_polish_stop = max(timer.elapsed(), timer.limit_seconds - CLUSTER_GLOBAL_MERGE_CAP);
-        int active_count = 0;
-        for (Node* leaf : order) {
-            if (leaf->state_started) ++active_count;
-        }
-        for (Node* leaf : order) {
-            if (timer.expired()) break;
-            if (timer.elapsed() >= block_polish_stop) break;
-            if (!leaf->state_started) continue;
-            double remaining = block_polish_stop - timer.elapsed();
-            double block_stop = (remaining >= 0.0 && active_count > 0)
-                                ? min(block_polish_stop, timer.elapsed() + remaining / active_count)
-                                : block_polish_stop;
-            leaf->solver->finish_search(leaf->state, block_stop);
-            --active_count;
-        }
     }
 
     vector<string> collect_lines(Node* node) {
@@ -3450,8 +2821,7 @@ struct ClusterManager {
     vector<string> global_merge_polish(const vector<string>& lines,
                                        const vector<string>& original_newicks,
                                        int original_n) {
-        if (CLUSTER_GLOBAL_MERGE_CAP <= 0.0 || timer.expired() ||
-            original_newicks.size() != 2 || lines.empty()) {
+        if (CLUSTER_GLOBAL_MERGE_CAP <= 0.0 || timer.expired() || lines.empty()) {
             return lines;
         }
 
@@ -3508,7 +2878,8 @@ struct ClusterManager {
         return out;
     }
 
-    vector<string> solve(vector<string> newicks, int n) {
+    vector<string> solve(vector<string> newicks) {
+        int n = AnnealSolver::infer_leaf_count(newicks);
         vector<string> original_newicks = newicks;
         unique_ptr<Node> root = build_node(move(newicks), n, 0);
         run_leaf_searches();
@@ -3533,10 +2904,10 @@ int main(int argc, char** argv) {
     signal(SIGINT, handle_signal);
 
     Timer timer(read_time_limit(argc, argv));
-    RawInput input = read_raw_input();
+    vector<string> newicks = read_raw_input();
 
     ClusterManager manager(timer);
-    vector<string> lines = manager.solve(move(input.newicks), input.n);
+    vector<string> lines = manager.solve(move(newicks));
     for (const string& line : lines) cout << line << ";\n";
     
     return 0;
