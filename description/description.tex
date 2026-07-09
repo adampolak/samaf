@@ -1,0 +1,191 @@
+\documentclass[a4paper,UKenglish,cleveref,autoref]{lipics-v2021}
+
+\hideLIPIcs
+
+\bibliographystyle{plainurl}% the mandatory bibstyle
+
+\title{A Simulated Annealing Heuristic for Maximum Agreement Forest}
+
+\author{Adam Polak}{Bocconi University}{adam.polak@unibocconi.it}{}{}
+\authorrunning{A. Polak}
+\Copyright{Adam Polak}
+
+\ccsdesc[500]{Theory of computation~Design and analysis of algorithms}
+\ccsdesc[300]{Applied computing~Bioinformatics}
+
+\keywords{maximum agreement forest, rooted phylogenetic trees, simulated annealing, PACE}
+
+\supplement{\url{https://github.com/adampolak/samaf}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We describe a solver for the Maximum Agreement Forest submitted for
+the heuristic track of PACE 2026 Challenge.
+The solver uses simulated annealing search representing a candidate solution by
+the set of edges cut in one input tree.
+Moreover it employs a few known reduction rules from the literature,
+and some ad-hoc pre- and post-processing heuristics.
+\end{abstract}
+
+\section{Overview}
+
+The input consists of two rooted binary phylogenetic trees \(T_1,T_2\) on the
+same taxon set \(\{1,\ldots,n\}\), given in the PACE Newick format.  The output
+is a set of rooted trees, one per line, that is obtainable from both inputs by
+deleting directed edges and suppressing degree-one vertices.  The objective is
+to minimize the number of output components.  For two rooted trees this is the
+usual rooted maximum agreement forest problem, equivalently the rooted SPR
+distance plus one under the PACE convention \cite{pace2026maf,bordewich2005}.
+
+The solver stores each parsed tree in postorder: every child has smaller index
+than its parent.  This makes bottom-up dynamic programs a plain forward scan and
+top-down propagation a reverse scan.  Preprocessing stores parent and child
+indices, leaf-to-node maps, Euler intervals, leaf ranks, subtree sizes, binary
+lifting ancestors, and a canonical identifier for every rooted subtree.  The
+canonical identifiers are maintained by an interner over ordered pairs of child
+identifiers.  They let the implementation compare cleaned rooted shapes by
+integer equality instead of string comparison.
+
+\section{Cut Encoding and Evaluation}
+
+A search state is a bit mask \(c\) on the non-root edges of \(T_1\).  Edge
+\(e\) is cut iff \(c_e=1\); the connected components of the remaining forest
+induce the candidate partition.
+
+Given \(c\), the evaluator first assigns every node of \(T_1\) to the
+root of its cut-induced component.  It then computes, for each component, the
+canonical cleaned shape in \(T_1\) and its total number of leaves.  A second
+linear scan over \(T_2\) checks whether each component appears as one connected
+cleaned subtree and whether different components ever overlap on an edge.  At
+any \(T_2\) node there may be at most one unfinished component continuing
+upward; two different unfinished components at the same node give an immediate
+conflict.  A component is feasible iff the completed shape in \(T_2\) matches
+the shape computed from \(T_1\).  The evaluator returns the component count and
+a penalty count.  The penalty count is zero exactly for valid agreement
+forests.  Positive penalty is accumulated for local certificates of
+infeasibility: a leaf assigned to no component, two different open components
+meeting at the same \(T_2\) edge, an unfinished component reaching the root of
+\(T_2\), a component that never closes in \(T_2\), or a closed component whose
+canonical \(T_2\) shape differs from its \(T_1\) shape.  The annealing energy is
+\[
+  E(c)=\#\mathrm{components}(c)+8\cdot \#\mathrm{penalties}(c).
+\]
+The constant $8$ in the above expression, as many other constants in the solver,
+were chosen empirically.
+
+The hot loop uses a fast evaluator with the same control flow, but replaces
+canonical shape identifiers by 64-bit polynomial hashes.  This has the same
+linear-time asymptotic complexity but in practice this is much cheaper
+than interning every temporary shape during annealing.  To avoid returning a
+hash false positive, every incumbent improvement is rechecked by the exact
+evaluator, and the final components are emitted only from an exact feasible
+evaluation.
+
+\section{Preprocessing: Reductions and Decomposition}
+
+Before search, the solver applies exhaustive local reductions.
+\emph{Common cherries} repeatedly contract identical pendant subtrees
+\cite{bordewich2005}.
+\emph{Oriented common four-chain} reductions delete the fourth taxon 
+of a matching rooted chain and remember how to expand it
+\cite{bordewich2005,KelkLM23}.
+The implemented \emph{3--2 chain} reduction removes a forced singleton component;
+this is the parameter-changing rule from the rooted kernelization literature
+\cite{KelkLM23}.  The reduced instance is relabelled densely, solved, and then
+expanded back to the original labels.  Expansion first lifts reduced components
+through the representative map, then reinserts deleted chain taxa into the
+appropriate component when possible, and finally appends forced singleton
+components.
+
+Large instances are recursively split on \emph{common clusters}
+\cite{bordewich2005,linzsemple2011,LiZ17}.  A cluster is found as a
+\(T_1\) subtree whose leaf ranks form an interval in \(T_2\) and whose size is
+large enough on both sides.  The most balanced such split is preferred.  The
+exact common-cluster reduction has an off-by-one case: depending on whether an
+optimal forest contains a component bridging the cluster boundary, the original
+optimum is either the sum of the two subproblem optima or one less.  Exact
+implementations resolve this by solving additional variants of the split
+subinstances.  Our heuristic does not solve these variants.  It simply solves
+the inside and outside subinstances independently, accepting the possible loss
+of one component per split in exchange for much smaller search spaces.  A final
+global merge reparses the original instance and tries to recover such
+boundary-bridging components by merging components across the split.
+
+There is also an early cut heuristic for very large blocks.  Before committing
+to a binary cluster split, the solver may run a short annealing phase on the
+block.  If this already finds a feasible forest with many components, the code
+searches for up to two disjoint common clusters whose sizes are close to
+\(n/3\), with a minimum side-size constraint.  These clusters and the remaining
+outside part become several children at once.  This is not a reduction rule; it
+is a decomposition heuristic that spends a small amount of search time to find
+a more balanced set of subinstances.
+
+\section{Initialization}
+
+The initial feasible solution is set to the singleton forest.
+On small instances ($n \leq 2000$) the solver also spends a small fraction of
+the budget on trying to greedily improve this initial solution before the
+annealing phase. The greedy improvement consists of going through all the cut
+edges one by one and uncutting them if this does not make the solution infeasible.
+
+\section{Annealing}
+
+The annealing temperature follows an exponential schedule from \(0.60\) to \(0.012\),
+following the standard simulated annealing paradigm \cite{kirkpatrick1983}.
+A proposed move is applied in-place and recorded as a short rollback list of changed edges.
+If the Metropolis test rejects the move, the rollback list restores the previous cut
+mask.
+
+The move distribution is biased toward reducing the number of cut
+edges: single toggle, remove, add, pair-remove, interval-guided swap, sibling
+swap, and parent/child level swap.
+The toggle move flips one random non-root edge.  The remove move samples cut
+edges and unsets one of them; add does the symmetric operation on an uncut edge.
+Pair-remove first removes one cut edge and then tries to remove a second cut
+edge chosen near it in a precomputed leaf-rank order.  The interval-guided swap
+removes a cut edge and tries to add an uncut edge with nearby \(T_2\) ranks,
+falling back to a plain removal if no such edge is found.  The sibling swap
+moves a cut from one child edge of a \(T_1\) fork to the sibling edge.  The
+level swap moves a cut one level upward to the parent edge, or one level
+downward to one of its child edges.
+
+Swap moves are more important at low temperature, so their weight is increased
+near the end of the schedule.
+Several proposal types use precomputed edge orders by the minimum and maximum leaf rank
+of a \(T_1\) subtree in both \(T_1\) and \(T_2\).  This gives local moves that
+tend to exchange cuts between nearby intervals rather than random unrelated
+edges.
+
+Because reductions, cluster decomposition, and the early cut heuristic can
+produce several independent leaf blocks, the solver does not finish one block
+before starting the next.  It initializes every leaf block, reserves time for
+polishing and the final global merge, and then interleaves annealing steps in
+rounds.  In each step a block is sampled with weight proportional to its current
+component count.  This is a sequential simulation of parallel search: every block
+keeps an exact feasible incumbent, so interruption leaves a complete solution.
+
+\section{Postprocessing}
+
+After annealing, the solver spends the reserved polishing budget ($1$ second) on
+deterministic improvements.
+Greedy deletion tries to remove cut edges while preserving feasibility.
+A swap polish tries sibling, ancestor, and descendant cut exchanges and then
+repeats deletion.
+
+\section{Development}
+
+This solver was developed as an experiment with heavy use of coding agents,
+primarily OpenAI Codex with GPT-5.5 and Claude Code with Sonnet 4.6.
+They were used for literature review, implementing initial versions of
+multiple approaches, and engineering improvements and heuristics in a continuous
+loop.
+
+We estimate that this project took 40 hours of human time, while the coding agents
+run for 140 hours in total and were given access to 50 CPU cores for testing.
+The API calls to the language models used approximately 250 million tokens.
+
+\bibliography{references}
+
+\end{document}
