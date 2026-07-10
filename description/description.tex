@@ -87,7 +87,7 @@ evaluation.
 
 Before search, the solver applies exhaustive local reductions.
 \emph{Common cherries} repeatedly contract identical pendant subtrees
-\cite{bordewich2005}.
+\cite{bordewich2005,ShiFYW16,KelkLM23}.
 \emph{Oriented common four-chain} reductions delete the fourth taxon 
 of a matching rooted chain and remember how to expand it
 \cite{bordewich2005,KelkLM23}.
@@ -107,7 +107,7 @@ exact common-cluster reduction has an off-by-one case: depending on whether an
 optimal forest contains a component bridging the cluster boundary, the original
 optimum is either the sum of the two subproblem optima or one less.  Exact
 implementations resolve this by solving additional variants of the split
-subinstances.  Our heuristic does not solve these variants.  It simply solves
+subinstances~\cite{Kelk26}.  Our heuristic does not solve these variants.  It simply solves
 the inside and outside subinstances independently, accepting the possible loss
 of one component per split in exchange for much smaller search spaces.  A final
 global merge reparses the original instance and tries to recover such
@@ -158,8 +158,8 @@ of a \(T_1\) subtree in both \(T_1\) and \(T_2\).  This gives local moves that
 tend to exchange cuts between nearby intervals rather than random unrelated
 edges.
 
-Because reductions, cluster decomposition, and the early cut heuristic can
-produce several independent leaf blocks, the solver does not finish one block
+The cluster decomposition and early cut heuristic can
+produce several independent leaf blocks. The solver does not finish one block
 before starting the next.  It initializes every leaf block, reserves time for
 polishing and the final global merge, and then interleaves annealing steps in
 rounds.  In each step a block is sampled with weight proportional to its current
@@ -181,6 +181,9 @@ primarily OpenAI Codex with GPT-5.5 and Claude Code with Sonnet 4.6.
 They were used for literature review, implementing initial versions of
 multiple approaches, and engineering improvements and heuristics in a continuous
 loop.
+
+Other tested approaches---which we eventually abandoned becuase initial implementations
+worked poorly compared to simulated annealing---included: Monte Carlo tree search, SAT, and ILP, with the last two used both as end-to-end solvers and large-neighborhood local search heuristics.
 
 We estimate that this project took 40 hours of human time, while the coding agents
 run for 140 hours in total and were given access to 50 CPU cores for testing.
